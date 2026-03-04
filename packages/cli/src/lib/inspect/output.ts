@@ -19,22 +19,39 @@ import type {
 } from '@workflow/world';
 import chalk from 'chalk';
 
-/** A function that resolves an encryption key for a given runId. */
-export type EncryptionKeyResolver =
-  | ((runId: string) => Promise<Uint8Array | undefined>)
-  | null;
-
-/** Create an EncryptionKeyResolver from a World instance */
-function createResolver(world: World): EncryptionKeyResolver {
-  if (!world.getEncryptionKeyForRun) return null;
-  return (runId: string) => world.getEncryptionKeyForRun!(runId);
-}
-
 import { formatDistance } from 'date-fns';
 import Table from 'easy-table';
 import { logger } from '../config/log.js';
 import type { InspectCLIOptions } from '../config/types.js';
-import { hydrateResourceIO } from './hydration.js';
+import {
+  type EncryptionKeyResolver,
+  hydrateResourceIO,
+  isEncryptedRef,
+} from './hydration.js';
+
+/**
+ * Create an EncryptionKeyResolver from a World instance.
+ * Returns null if decrypt is false — encrypted data will show as a placeholder.
+ *
+ * The resolver fetches the full WorkflowRun (cached per runId) so that the
+ * World can inspect deployment-specific fields for key resolution.
+ */
+function createResolver(world: World, decrypt: boolean): EncryptionKeyResolver {
+  if (!decrypt) return null;
+  if (!world.getEncryptionKeyForRun) return null;
+  const cache = new Map<string, Promise<Uint8Array | undefined>>();
+  return (runId: string) => {
+    let cached = cache.get(runId);
+    if (!cached) {
+      cached = world.runs
+        .get(runId)
+        .then((run) => world.getEncryptionKeyForRun!(run));
+      cache.set(runId, cached);
+    }
+    return cached;
+  };
+}
+
 import { setupListPagination } from './pagination.js';
 import { streamToConsole } from './stream.js';
 import {
@@ -487,6 +504,8 @@ const inlineFormatIO = <T>(io: T, topLevel: boolean = true): string => {
     value = '<empty>';
   } else if (io === null) {
     value = '<null>';
+  } else if (isEncryptedRef(io)) {
+    value = chalk.dim.yellow('\u{1F512} Encrypted');
   } else if (io && Array.isArray(io)) {
     if (io.length === 0) {
       value = '<empty>';
@@ -521,7 +540,8 @@ const inlineFormatIO = <T>(io: T, topLevel: boolean = true): string => {
 };
 
 export const listRuns = async (world: World, opts: InspectCLIOptions = {}) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.stepId || opts.runId) {
     logger.warn(
       'Filtering by step-id or run-id is not supported in list calls, ignoring filter.'
@@ -601,7 +621,8 @@ export const getRecentRun = async (
   world: World,
   opts: InspectCLIOptions = {}
 ) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   logger.warn(`No runId provided, fetching data for latest run instead.`);
   try {
     const runs = await world.runs.list({
@@ -625,7 +646,8 @@ export const showRun = async (
   runId: string,
   opts: InspectCLIOptions = {}
 ) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.withData) {
     logger.warn('`withData` flag is ignored when showing individual resources');
   }
@@ -657,7 +679,8 @@ export const listSteps = async (
     runId: undefined,
   }
 ) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.stepId) {
     logger.warn(
       'Filtering by step-id is not supported in list calls, ignoring filter.'
@@ -749,7 +772,8 @@ export const showStep = async (
   stepId: string,
   opts: InspectCLIOptions = {}
 ) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.withData) {
     logger.warn('`withData` flag is ignored when showing individual resources');
   }
@@ -789,15 +813,18 @@ export const showStream = async (
   }
   const rawStream = await world.readFromStream(streamId);
 
-  // Resolve the encryption key if a runId is provided (needed for encrypted streams).
-  // The key is passed as a promise so stream construction is synchronous —
-  // it will be resolved lazily on the first encrypted frame.
+  // Only resolve the encryption key when --decrypt is passed and a runId is available.
+  // Without --decrypt, encrypted frames will pass through as-is.
   let encryptionKey: EncryptionKeyParam;
-  if (opts.runId) {
+  if (opts.decrypt && opts.runId) {
     encryptionKey = (async () => {
       const rawKey = await world.getEncryptionKeyForRun?.(opts.runId!);
       return rawKey ? await importKey(rawKey) : undefined;
     })();
+  } else if (opts.decrypt && !opts.runId) {
+    logger.warn(
+      'Cannot decrypt stream content without a run ID. Use --run=<run-id> with --decrypt.'
+    );
   }
 
   // Deserialize the stream to get JavaScript objects
@@ -877,6 +904,7 @@ export const listEvents = async (
   world: World,
   opts: InspectCLIOptions = {}
 ) => {
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
   if (opts.workflowName) {
     logger.warn(
       'Filtering by workflow-name is not supported for events, ignoring filter.'
@@ -925,7 +953,10 @@ export const listEvents = async (
     logger.debug(`Fetching events for run ${filterId}`);
     try {
       const events = await listCall(filterId, {});
-      showJson(events.data);
+      const hydratedEvents = await Promise.all(
+        events.data.map((e) => hydrateResourceIO(e, resolveKey))
+      );
+      showJson(hydratedEvents);
       return;
     } catch (error) {
       if (handleApiError(error, opts.backend)) {
@@ -955,14 +986,18 @@ export const listEvents = async (
       }
     },
     displayPage: async (events) => {
-      logger.log(showTable(events, props, opts));
+      const hydratedEvents = await Promise.all(
+        events.map((e) => hydrateResourceIO(e, resolveKey))
+      );
+      logger.log(showTable(hydratedEvents, props, opts));
       showInspectInfoBox('event');
     },
   });
 };
 
 export const listHooks = async (world: World, opts: InspectCLIOptions = {}) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.workflowName) {
     logger.warn(
       'Filtering by workflow-name is not supported for hooks, ignoring filter.'
@@ -1054,7 +1089,8 @@ export const showHook = async (
   hookId: string,
   opts: InspectCLIOptions = {}
 ) => {
-  const resolveKey = createResolver(world);
+  const resolveKey = createResolver(world, opts?.decrypt ?? false);
+
   if (opts.withData) {
     logger.warn('`withData` flag is ignored when showing individual resources');
   }
