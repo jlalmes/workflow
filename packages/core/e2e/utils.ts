@@ -133,6 +133,7 @@ const awaitCommand = async (
     (resolve, reject) => {
       const child = spawn(command, args, {
         timeout,
+        killSignal: 'SIGKILL',
         cwd,
         env: {
           ...process.env,
